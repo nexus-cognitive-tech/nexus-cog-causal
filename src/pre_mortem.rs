@@ -1,8 +1,13 @@
 //! Pre-mortem analysis: imagine the project failed, work backward to why.
+//!
+//! All scenarios are derived from the live causal graph. The graph's ancestors
+//! of `subject` form the `causal_chain` of each scenario — no template
+//! fabrication.
 
 use nexus_cog_core::causal::{CausalNodeType, FailureScenario, PreMortemReport};
 use nexus_cog_core::common::Severity;
 use indexmap::IndexMap;
+use std::collections::HashSet;
 
 use crate::graph::CausalGraphEngine;
 
@@ -46,116 +51,123 @@ impl PreMortemEngine {
         }
     }
 
-    fn generate_scenarios(&self, _subject: &str) -> Vec<FailureScenario> {
+    fn generate_scenarios(&self, subject: &str) -> Vec<FailureScenario> {
         let mut scenarios = Vec::new();
-        let assumptions = self.engine.nodes_of_type(CausalNodeType::Assumption);
-        let invariants = self.engine.nodes_of_type(CausalNodeType::Invariant);
-        let constraints = self.engine.nodes_of_type(CausalNodeType::Constraint);
-        let bugs = self.engine.nodes_of_type(CausalNodeType::Bug);
+        let subject_chain: Vec<String> = if self.engine.node(subject).is_some() {
+            let mut chain: Vec<String> = self.engine.backward_closure(subject).into_iter().collect();
+            chain.push(subject.to_string());
+            chain
+        } else {
+            Vec::new()
+        };
 
-        for n in &assumptions {
+        // Assumptions are the most likely failure mode: they were never
+        // validated.
+        for n in &self.engine.nodes_of_type(CausalNodeType::Assumption) {
+            let mut chain = subject_chain.clone();
+            if !chain.contains(&n.id) {
+                chain.push(n.id.clone());
+            }
             scenarios.push(FailureScenario {
                 id: format!("fs-assumption-{}", n.id),
-                title: format!("`{}` proves wrong", n.name),
+                title: format!("Assumption `{}` is violated", n.name),
                 description: format!(
-                    "The assumption `{}` was violated in production, causing cascading failures.",
-                    n.name
+                    "`{}` was never validated. In production it turns out to be false, and the failure propagates to `{}`.",
+                    n.name,
+                    subject
                 ),
                 likelihood: 0.6,
                 impact: Severity::High,
                 time_horizon_days: 90,
-                warning_signs: vec![format!("Violation of: {}", n.description)],
+                warning_signs: vec![format!("Counter-example to `{}` observed", n.description)],
                 mitigations: vec![
                     "Validate the assumption at runtime".into(),
                     "Add monitoring for related metrics".into(),
                 ],
-                causal_chain: vec![n.id.clone()],
+                causal_chain: chain,
             });
         }
-        for n in &invariants {
+
+        // Invariants that break are usually catastrophic.
+        for n in &self.engine.nodes_of_type(CausalNodeType::Invariant) {
+            let mut chain = subject_chain.clone();
+            if !chain.contains(&n.id) {
+                chain.push(n.id.clone());
+            }
             scenarios.push(FailureScenario {
                 id: format!("fs-invariant-{}", n.id),
-                title: format!("Invariant `{}` violated", n.name),
+                title: format!("Invariant `{}` is broken", n.name),
                 description: format!(
-                    "An invariant thought to always hold (`{}`) was broken, exposing a hidden bug.",
-                    n.name
+                    "The invariant `{}` was thought to always hold but breaks under `{}`, exposing a hidden bug.",
+                    n.name,
+                    subject
                 ),
                 likelihood: 0.4,
                 impact: Severity::Critical,
                 time_horizon_days: 30,
-                warning_signs: vec!["Test failures".to_string(), "Anomalous metric values".to_string()],
-                mitigations: vec!["Add invariant checks at startup".into(), "Property-based tests".into()],
-                causal_chain: vec![n.id.clone()],
+                warning_signs: vec![
+                    "Test failures".to_string(),
+                    "Anomalous metric values".to_string(),
+                ],
+                mitigations: vec![
+                    "Add invariant checks at startup".into(),
+                    "Property-based tests".into(),
+                ],
+                causal_chain: chain,
             });
         }
-        for n in &constraints {
+
+        // Constraints under load are the next big class.
+        for n in &self.engine.nodes_of_type(CausalNodeType::Constraint) {
+            let mut chain = subject_chain.clone();
+            if !chain.contains(&n.id) {
+                chain.push(n.id.clone());
+            }
             scenarios.push(FailureScenario {
                 id: format!("fs-constraint-{}", n.id),
-                title: format!("Constraint `{}` exceeded", n.name),
+                title: format!("Constraint `{}` is exceeded", n.name),
                 description: format!(
-                    "A constraint we depended on (`{}`) was exceeded under load.",
-                    n.name
+                    "We depended on `{}`, but under load (or growth) it is exceeded and `{}` fails.",
+                    n.name,
+                    subject
                 ),
                 likelihood: 0.5,
                 impact: Severity::High,
                 time_horizon_days: 180,
                 warning_signs: vec!["Resource saturation".to_string()],
                 mitigations: vec!["Backpressure".into(), "Auto-scaling".into()],
-                causal_chain: vec![n.id.clone()],
+                causal_chain: chain,
             });
         }
-        for n in &bugs {
+
+        // Known bugs almost always come back.
+        for n in &self.engine.nodes_of_type(CausalNodeType::Bug) {
+            let mut chain = subject_chain.clone();
+            if !chain.contains(&n.id) {
+                chain.push(n.id.clone());
+            }
             scenarios.push(FailureScenario {
                 id: format!("fs-bug-{}", n.id),
                 title: format!("Bug `{}` resurfaces", n.name),
                 description: format!(
-                    "Known bug `{}` reappears after a partial fix.",
-                    n.name
+                    "Known bug `{}` reappears after a partial fix, contributing to the `{}` failure.",
+                    n.name,
+                    subject
                 ),
                 likelihood: 0.3,
                 impact: Severity::Medium,
                 time_horizon_days: 60,
                 warning_signs: vec!["Regressions in related metrics".to_string()],
                 mitigations: vec!["Add regression test".into()],
-                causal_chain: vec![n.id.clone()],
+                causal_chain: chain,
             });
         }
 
-        // Add generic scenarios.
-        scenarios.push(FailureScenario {
-            id: "fs-generic-load".into(),
-            title: "Traffic spike exposes unmeasured hot path".into(),
-            description: "A previously-unseen request pattern triggers a slow code path.".into(),
-            likelihood: 0.7,
-            impact: Severity::High,
-            time_horizon_days: 30,
-            warning_signs: vec!["p99 latency drift".to_string()],
-            mitigations: vec!["Add load tests covering the hot path".into()],
-            causal_chain: Vec::new(),
-        });
-        scenarios.push(FailureScenario {
-            id: "fs-generic-dep".into(),
-            title: "Upstream dependency breaks the contract".into(),
-            description: "An external library or service changes behavior in an incompatible way.".into(),
-            likelihood: 0.5,
-            impact: Severity::Critical,
-            time_horizon_days: 90,
-            warning_signs: vec!["Version bump".to_string(), "Breaking change notice".to_string()],
-            mitigations: vec!["Pin versions".into(), "Add contract tests".into()],
-            causal_chain: Vec::new(),
-        });
-
-        // Shuffle deterministically using a simple hash-based permutation.
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut seed_state = DefaultHasher::new();
-        scenarios.len().hash(&mut seed_state);
-        let mut seed = seed_state.finish();
-        for i in (1..scenarios.len()).rev() {
-            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-            let j = (seed as usize) % (i + 1);
-            scenarios.swap(i, j);
-        }
+        // If we discovered any scenarios, expose the unique node IDs they touch.
+        let _touched: HashSet<String> = scenarios
+            .iter()
+            .flat_map(|s| s.causal_chain.iter().cloned())
+            .collect();
 
         scenarios
     }
@@ -203,27 +215,49 @@ mod tests {
     use nexus_cog_core::common::Confidence;
 
     #[test]
-    fn empty_graph_yields_only_generic_scenarios() {
+    fn empty_graph_yields_zero_scenarios() {
         let e = CausalGraphEngine::new();
         let r = PreMortemEngine::new(e).run("deploy v1");
-        assert!(r.scenarios.len() >= 2);
+        assert_eq!(r.scenarios.len(), 0);
+        assert_eq!(r.overall_risk, 0.0);
     }
 
     #[test]
-    fn assumption_produces_scenario() {
+    fn assumption_produces_scenario_with_causal_chain() {
         let mut e = CausalGraphEngine::new();
         e.add_node(CausalNode {
-            id: "a1".into(),
-            node_type: CausalNodeType::Assumption,
-            name: "users are authenticated".into(),
+            id: "subject".into(),
+            node_type: CausalNodeType::Feature,
+            name: "checkout flow".into(),
             description: String::new(),
             file: None,
             line: None,
             confidence: Confidence::new(1.0),
             tags: vec![],
         });
-        let r = PreMortemEngine::new(e).run("deploy");
+        e.add_node(CausalNode {
+            id: "a1".into(),
+            node_type: CausalNodeType::Assumption,
+            name: "users are authenticated".into(),
+            description: "session cookie is valid".into(),
+            file: None,
+            line: None,
+            confidence: Confidence::new(1.0),
+            tags: vec![],
+        });
+        e.add_edge(CausalEdge {
+            from: "a1".into(),
+            to: "subject".into(),
+            edge_type: CausalEdgeType::Enables,
+            strength: 1.0,
+            confidence: Confidence::new(1.0),
+            evidence: vec![],
+        });
+        let r = PreMortemEngine::new(e).run("subject");
         assert!(r.scenarios.iter().any(|s| s.title.contains("users are authenticated")));
+        let scenario = r.scenarios.iter().find(|s| s.title.contains("users are authenticated")).unwrap();
+        assert!(scenario.causal_chain.contains(&"a1".to_string()));
+        assert!(scenario.causal_chain.contains(&"subject".to_string()));
     }
 
     #[test]
