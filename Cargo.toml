@@ -14,7 +14,7 @@ readme = "README.md"
 
 [dependencies]
 nexus-cog-core = { git = "https://github.com/nexus-cognitive-tech/nexus-cog-core", tag = "v0.1.2" }
-nexus-cog-storage = { git = "https://github.com/nexus-cognitive-tech/nexus-cog-storage", tag = "v0.1.0" }
+nexus-cog-storage = { git = "https://github.com/nexus-cognitive-tech/nexus-cog-storage", tag = "v0.1.1" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
