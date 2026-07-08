@@ -216,7 +216,7 @@ mod tests {
 
     #[test]
     fn empty_graph_yields_zero_scenarios() {
-        let e = CausalGraphEngine::new();
+        let e = CausalGraphEngine::in_memory().unwrap();
         let r = PreMortemEngine::new(e).run("deploy v1");
         assert_eq!(r.scenarios.len(), 0);
         assert_eq!(r.overall_risk, 0.0);
@@ -224,7 +224,7 @@ mod tests {
 
     #[test]
     fn assumption_produces_scenario_with_causal_chain() {
-        let mut e = CausalGraphEngine::new();
+        let mut e = CausalGraphEngine::in_memory().unwrap();
         e.add_node(CausalNode {
             id: "subject".into(),
             node_type: CausalNodeType::Feature,
@@ -262,7 +262,7 @@ mod tests {
 
     #[test]
     fn top_risks_bounded_to_five() {
-        let e = CausalGraphEngine::new();
+        let e = CausalGraphEngine::in_memory().unwrap();
         let r = PreMortemEngine::new(e).run("x");
         assert!(r.top_risks.len() <= 5);
     }

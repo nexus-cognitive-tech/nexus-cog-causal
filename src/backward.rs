@@ -168,7 +168,7 @@ mod tests {
     use nexus_cog_core::common::Confidence;
 
     fn build() -> CausalGraphEngine {
-        let mut e = CausalGraphEngine::new();
+        let mut e = CausalGraphEngine::in_memory().unwrap();
         for id in ["root_cause", "intermediate", "bug"] {
             e.add_node(CausalNode {
                 id: id.into(),

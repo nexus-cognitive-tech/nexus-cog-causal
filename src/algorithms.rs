@@ -14,7 +14,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use nexus_cog_core::causal::CausalNode;
+use nexus_cog_core::causal::{CausalEdge, CausalNode};
 use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
 
@@ -154,7 +154,7 @@ pub fn strongly_connected_components(engine: &CausalGraphEngine, min_size: usize
 #[allow(clippy::too_many_arguments)]
 fn tarjan_strongconnect(
     v: NodeIndex,
-    g: &petgraph::graph::DiGraph<CausalNode, ()>,
+    g: &petgraph::graph::DiGraph<CausalNode, CausalEdge>,
     index: &mut usize,
     indices: &mut HashMap<NodeIndex, usize>,
     lowlinks: &mut HashMap<NodeIndex, usize>,
@@ -372,7 +372,7 @@ pub fn example_graph() -> (CausalGraphEngine, Vec<&'static str>) {
     use nexus_cog_core::causal::{CausalEdge, CausalEdgeType, CausalNode, CausalNodeType};
     use nexus_cog_core::common::Confidence;
 
-    let mut g = CausalGraphEngine::new();
+    let mut g = CausalGraphEngine::in_memory().unwrap();
     for id in ["a", "b", "c", "d", "e"] {
         g.add_node(CausalNode {
             id: id.into(),

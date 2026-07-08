@@ -202,7 +202,7 @@ mod tests {
     use nexus_cog_core::common::Confidence;
 
     fn build() -> CausalGraphEngine {
-        let mut e = CausalGraphEngine::new();
+        let mut e = CausalGraphEngine::in_memory().unwrap();
         e.add_node(CausalNode {
             id: "invalid_input".into(),
             node_type: CausalNodeType::Assumption,

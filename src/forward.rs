@@ -40,7 +40,7 @@ impl ForwardReasoner {
         };
         // DFS to find longest path from start.
         fn dfs_depth(
-            g: &petgraph::Graph<nexus_cog_core::causal::CausalNode, ()>,
+            g: &petgraph::Graph<nexus_cog_core::causal::CausalNode, nexus_cog_core::causal::CausalEdge>,
             node: petgraph::graph::NodeIndex,
             visited: &mut std::collections::HashSet<petgraph::graph::NodeIndex>,
         ) -> usize {
@@ -89,7 +89,7 @@ mod tests {
     use nexus_cog_core::common::Confidence;
 
     fn build() -> CausalGraphEngine {
-        let mut e = CausalGraphEngine::new();
+        let mut e = CausalGraphEngine::in_memory().unwrap();
         e.add_node(CausalNode {
             id: "a".into(),
             node_type: CausalNodeType::CodeEntity,

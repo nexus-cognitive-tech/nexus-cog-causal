@@ -92,7 +92,7 @@ mod tests {
     use nexus_cog_core::common::Confidence;
 
     fn build() -> CausalGraphEngine {
-        let mut e = CausalGraphEngine::new();
+        let mut e = CausalGraphEngine::in_memory().unwrap();
         for id in ["core", "feature_a", "feature_b", "invariant_x"] {
             e.add_node(CausalNode {
                 id: id.into(),
@@ -154,7 +154,7 @@ mod tests {
 
     #[test]
     fn zero_affected_yields_low_risk() {
-        let mut e = CausalGraphEngine::new();
+        let mut e = CausalGraphEngine::in_memory().unwrap();
         e.add_node(CausalNode {
             id: "isolated".into(),
             node_type: CausalNodeType::CodeEntity,

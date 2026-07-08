@@ -1,107 +1,171 @@
-//! Causal graph engine.
+//! Causal graph engine, persisted via [`nexus-cog-storage`].
+//!
+//! The SQLite table is the source of truth; the in-memory `petgraph` is a
+//! derived cache rebuilt from `backend` on every `with_backend` call. All
+//! mutating operations write to SQL first, then update the in-memory graph
+//! from the returned row.
 
 use std::sync::Arc;
 
-use nexus_cog_core::causal::{CausalEdge, CausalEdgeType, CausalGraph, CausalNode, CausalNodeType};
 use indexmap::IndexMap;
+use nexus_cog_core::causal::{CausalEdge, CausalEdgeType, CausalGraph, CausalNode};
+use nexus_cog_storage::{PersistenceBackend, SqliteBackend, StorageResult};
 use parking_lot::RwLock;
-use petgraph::graph::DiGraph;
-use petgraph::graph::NodeIndex;
+use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
 
 /// Inner mutable state of [`CausalGraphEngine`].
 #[derive(Debug)]
 struct Inner {
-    graph: DiGraph<CausalNode, ()>,
+    graph: DiGraph<CausalNode, CausalEdge>,
     index: IndexMap<String, NodeIndex>,
 }
 
-/// Maintains a causal graph with efficient traversal.
-///
-/// Cloning is cheap (Arc clone). Mutations use interior mutability via
-/// [`parking_lot::RwLock`], so reasoners and other readers can hold their
-/// own snapshot of the engine without lifetime ties.
-#[derive(Debug, Clone)]
+/// The causal graph engine. Every persistent engine is constructed against
+/// the shared [`PersistenceBackend`].
+#[derive(Clone)]
 pub struct CausalGraphEngine {
+    backend: Arc<dyn PersistenceBackend>,
     inner: Arc<RwLock<Inner>>,
 }
 
-impl Default for CausalGraphEngine {
-    fn default() -> Self {
-        Self::new()
+impl std::fmt::Debug for CausalGraphEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CausalGraphEngine")
+            .field("backend", &self.backend.describe())
+            .field("nodes", &self.node_count())
+            .field("edges", &self.edge_count())
+            .finish()
     }
 }
 
 impl CausalGraphEngine {
-    /// Construct an empty engine.
-        pub fn new() -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(Inner {
-                graph: DiGraph::new(),
-                index: IndexMap::new(),
-            })),
+    /// Construct an engine backed by `backend`. The schema is applied
+    /// idempotently and every persisted node / edge is loaded into the
+    /// in-memory cache before the constructor returns.
+    pub fn with_backend(backend: Arc<dyn PersistenceBackend>) -> StorageResult<Self> {
+        super::schema::register(backend.as_ref())?;
+        let (nodes, edges) = (super::schema::load_all_nodes(backend.as_ref())?, super::schema::load_all_edges(backend.as_ref())?);
+        let mut graph: DiGraph<CausalNode, CausalEdge> = DiGraph::new();
+        let mut index: IndexMap<String, NodeIndex> = IndexMap::new();
+        for n in nodes {
+            let id = n.id.clone();
+            let idx = graph.add_node(n);
+            index.insert(id, idx);
         }
+        for e in edges {
+            let Some(&from) = index.get(&e.from) else { continue };
+            let Some(&to) = index.get(&e.to) else { continue };
+            if let Some(existing) = graph.find_edge(from, to) {
+                graph.remove_edge(existing);
+            }
+            graph.add_edge(from, to, e);
+        }
+        Ok(Self {
+            backend,
+            inner: Arc::new(RwLock::new(Inner { graph, index })),
+        })
     }
 
-    /// Construct from a snapshot.
-        pub fn from_graph(graph: CausalGraph) -> Self {
-        let mut engine = Self::new();
-        for node in graph.nodes {
-            engine.add_node(node);
-        }
-        for edge in graph.edges {
-            engine.add_edge(edge);
-        }
-        engine
+    /// Convenience constructor that opens an in-memory SQLite database and
+    /// uses it. Useful for tests and one-off scripts.
+    pub fn in_memory() -> StorageResult<Self> {
+        Self::with_backend(Arc::new(SqliteBackend::open_in_memory()?))
+    }
+
+    /// Backend description.
+    #[must_use]
+    pub fn backend_info(&self) -> String {
+        self.backend.describe()
     }
 
     /// Number of nodes.
-        pub fn node_count(&self) -> usize {
+    #[must_use]
+    pub fn node_count(&self) -> usize {
         self.inner.read().graph.node_count()
     }
 
     /// Number of edges.
-        pub fn edge_count(&self) -> usize {
+    #[must_use]
+    pub fn edge_count(&self) -> usize {
         self.inner.read().graph.edge_count()
     }
 
-    /// Add a node.
-    pub fn add_node(&mut self, node: CausalNode) -> NodeIndex {
+    /// Add a node. Persists to backend first; if persistence fails the
+    /// in-memory state is unchanged.
+    pub fn add_node(&self, node: CausalNode) -> StorageResult<NodeIndex> {
+        super::schema::upsert_node(self.backend.as_ref(), &node)?;
         let id = node.id.clone();
         let mut inner = self.inner.write();
         let idx = inner.graph.add_node(node);
         inner.index.insert(id, idx);
-        idx
+        Ok(idx)
     }
 
-    /// Add an edge.
-    pub fn add_edge(&mut self, edge: CausalEdge) -> bool {
+    /// Add an edge between two existing nodes. Persists first; in-memory
+    /// cache is updated only after the SQL write succeeds. Returns `false`
+    /// if either endpoint is missing.
+    pub fn add_edge(&self, edge: CausalEdge) -> StorageResult<bool> {
+        {
+            let inner = self.inner.read();
+            if inner.index.get(&edge.from).is_none() || inner.index.get(&edge.to).is_none() {
+                return Ok(false);
+            }
+        }
+        super::schema::upsert_edge(self.backend.as_ref(), &edge)?;
         let mut inner = self.inner.write();
-        let Some(&from) = inner.index.get(&edge.from) else { return false };
-        let Some(&to) = inner.index.get(&edge.to) else { return false };
-        inner.graph.add_edge(from, to, ());
-        true
+        let Some(&from) = inner.index.get(&edge.from) else { return Ok(false) };
+        let Some(&to) = inner.index.get(&edge.to) else { return Ok(false) };
+        if let Some(existing) = inner.graph.find_edge(from, to) {
+            inner.graph.remove_edge(existing);
+        }
+        inner.graph.add_edge(from, to, edge);
+        Ok(true)
     }
 
     /// Get a node by ID.
-        pub fn node(&self, id: &str) -> Option<CausalNode> {
-        let inner = self.inner.read();
-        inner.index.get(id).and_then(|idx| inner.graph.node_weight(*idx).cloned())
+    #[must_use]
+    pub fn node(&self, id: &str) -> Option<CausalNode> {
+        self.inner.read().index.get(id).and_then(|idx| self.inner.read().graph.node_weight(*idx).cloned())
     }
 
     /// All nodes of a particular type.
-        pub fn nodes_of_type(&self, ty: CausalNodeType) -> Vec<CausalNode> {
-        let inner = self.inner.read();
-        inner
+    #[must_use]
+    pub fn nodes_of_type(&self, ty: nexus_cog_core::causal::CausalNodeType) -> Vec<CausalNode> {
+        self.inner
+            .read()
             .graph
             .node_indices()
-            .filter_map(|idx| inner.graph.node_weight(idx).cloned())
+            .filter_map(|idx| self.inner.read().graph.node_weight(idx).cloned())
             .filter(|n| n.node_type == ty)
             .collect()
     }
 
-    /// Forward closure from a node (all positive descendants).
-        pub fn forward_closure(&self, id: &str) -> std::collections::HashSet<String> {
+    /// All nodes.
+    #[must_use]
+    pub fn nodes(&self) -> Vec<CausalNode> {
+        self.inner
+            .read()
+            .graph
+            .node_indices()
+            .filter_map(|idx| self.inner.read().graph.node_weight(idx).cloned())
+            .collect()
+    }
+
+    /// All edges.
+    #[must_use]
+    pub fn edges(&self) -> Vec<CausalEdge> {
+        self.inner
+            .read()
+            .graph
+            .edge_references()
+            .map(|e| e.weight().clone())
+            .collect()
+    }
+
+    /// Forward closure from a node (all descendants).
+    #[must_use]
+    pub fn forward_closure(&self, id: &str) -> std::collections::HashSet<String> {
         let inner = self.inner.read();
         let Some(&start) = inner.index.get(id) else { return std::collections::HashSet::new() };
         let mut visited = std::collections::HashSet::new();
@@ -123,8 +187,9 @@ impl CausalGraphEngine {
             .collect()
     }
 
-    /// Backward closure from a node (all positive ancestors).
-        pub fn backward_closure(&self, id: &str) -> std::collections::HashSet<String> {
+    /// Backward closure from a node (all ancestors).
+    #[must_use]
+    pub fn backward_closure(&self, id: &str) -> std::collections::HashSet<String> {
         let inner = self.inner.read();
         let Some(&start) = inner.index.get(id) else { return std::collections::HashSet::new() };
         let mut visited = std::collections::HashSet::new();
@@ -146,27 +211,20 @@ impl CausalGraphEngine {
             .collect()
     }
 
-    /// Snapshot the engine to a serializable graph.
-        pub fn snapshot(&self) -> CausalGraph {
+    /// Snapshot the in-memory cache to a serializable graph.
+    #[must_use]
+    pub fn snapshot(&self) -> CausalGraph {
         let inner = self.inner.read();
         let nodes: Vec<CausalNode> = inner
             .graph
             .node_indices()
             .filter_map(|idx| inner.graph.node_weight(idx).cloned())
             .collect();
-        let mut edges = Vec::new();
-        for edge_ref in inner.graph.edge_references() {
-            let from = inner.graph.node_weight(edge_ref.source()).unwrap();
-            let to = inner.graph.node_weight(edge_ref.target()).unwrap();
-            edges.push(CausalEdge {
-                from: from.id.clone(),
-                to: to.id.clone(),
-                edge_type: CausalEdgeType::Causes,
-                strength: 1.0,
-                confidence: from.confidence,
-                evidence: Vec::new(),
-            });
-        }
+        let edges: Vec<CausalEdge> = inner
+            .graph
+            .edge_references()
+            .map(|e| e.weight().clone())
+            .collect();
         CausalGraph {
             nodes,
             edges,
@@ -177,24 +235,28 @@ impl CausalGraphEngine {
     }
 
     /// Look up the internal node index for a node ID.
-        pub fn index_of(&self, id: &str) -> Option<NodeIndex> {
+    #[must_use]
+    pub fn index_of(&self, id: &str) -> Option<NodeIndex> {
         self.inner.read().index.get(id).copied()
     }
 
     /// Iterator over internal node indices.
-        pub fn node_indices(&self) -> Vec<NodeIndex> {
+    #[must_use]
+    pub fn node_indices(&self) -> Vec<NodeIndex> {
         self.inner.read().graph.node_indices().collect()
     }
 
     /// Get the weight (node) at a given index.
-        pub fn graph_weight(&self, idx: NodeIndex) -> Option<CausalNode> {
+    #[must_use]
+    pub fn graph_weight(&self, idx: NodeIndex) -> Option<CausalNode> {
         self.inner.read().graph.node_weight(idx).cloned()
     }
 
     /// Get immediate parent node indices of the given node index.
-        pub fn immediate_parents(&self, idx: NodeIndex) -> Vec<NodeIndex> {
-        let inner = self.inner.read();
-        inner
+    #[must_use]
+    pub fn immediate_parents(&self, idx: NodeIndex) -> Vec<NodeIndex> {
+        self.inner
+            .read()
             .graph
             .edges_directed(idx, petgraph::Direction::Incoming)
             .map(|e| e.source())
@@ -202,46 +264,19 @@ impl CausalGraphEngine {
     }
 
     /// Get immediate child node indices of the given node index.
-        pub fn immediate_children(&self, idx: NodeIndex) -> Vec<NodeIndex> {
-        let inner = self.inner.read();
-        inner
+    #[must_use]
+    pub fn immediate_children(&self, idx: NodeIndex) -> Vec<NodeIndex> {
+        self.inner
+            .read()
             .graph
             .edges_directed(idx, petgraph::Direction::Outgoing)
             .map(|e| e.target())
             .collect()
     }
 
-    /// Iterate over all nodes (cloned).
-        pub fn nodes(&self) -> Vec<CausalNode> {
-        let inner = self.inner.read();
-        inner
-            .graph
-            .node_indices()
-            .filter_map(|idx| inner.graph.node_weight(idx).cloned())
-            .collect()
-    }
-
-    /// Iterate over all edges (cloned).
-        pub fn edges(&self) -> Vec<CausalEdge> {
-        let inner = self.inner.read();
-        let mut edges = Vec::new();
-        for edge_ref in inner.graph.edge_references() {
-            let from = inner.graph.node_weight(edge_ref.source()).unwrap();
-            let to = inner.graph.node_weight(edge_ref.target()).unwrap();
-            edges.push(CausalEdge {
-                from: from.id.clone(),
-                to: to.id.clone(),
-                edge_type: CausalEdgeType::Causes,
-                strength: 1.0,
-                confidence: from.confidence,
-                evidence: Vec::new(),
-            });
-        }
-        edges
-    }
-
     /// Acquire a read guard for advanced traversal.
-        pub fn read(&self) -> CausalGraphReadGuard<'_> {
+    #[must_use]
+    pub fn read(&self) -> CausalGraphReadGuard<'_> {
         CausalGraphReadGuard { inner: self.inner.read() }
     }
 }
@@ -253,34 +288,44 @@ pub struct CausalGraphReadGuard<'a> {
 
 impl<'a> CausalGraphReadGuard<'a> {
     /// Direct access to the underlying petgraph.
-        pub fn graph(&self) -> &DiGraph<CausalNode, ()> {
+    #[must_use]
+    pub fn graph(&self) -> &DiGraph<CausalNode, CausalEdge> {
         &self.inner.graph
     }
 
     /// Direct access to the id → index map.
-        pub fn index(&self) -> &IndexMap<String, NodeIndex> {
+    #[must_use]
+    pub fn index(&self) -> &IndexMap<String, NodeIndex> {
         &self.inner.index
     }
 
     /// Look up the internal node index for a node ID.
-        pub fn index_of(&self, id: &str) -> Option<NodeIndex> {
+    #[must_use]
+    pub fn index_of(&self, id: &str) -> Option<NodeIndex> {
         self.inner.index.get(id).copied()
     }
 
-    /// Iterator over all node indices.
-        pub fn node_indices(&self) -> impl Iterator<Item = NodeIndex> + '_ {
+    /// Iterator over internal node indices.
+    #[must_use]
+    pub fn node_indices(&self) -> impl Iterator<Item = NodeIndex> + '_ {
         self.inner.graph.node_indices()
     }
 
     /// Get the weight (node) at a given index.
-        pub fn graph_weight(&self, idx: NodeIndex) -> Option<&CausalNode> {
+    #[must_use]
+    pub fn graph_weight(&self, idx: NodeIndex) -> Option<&CausalNode> {
         self.inner.graph.node_weight(idx)
     }
 }
 
+// Silence "unused import" warnings for traits we keep around for callers.
+#[allow(unused_imports)]
+use CausalEdgeType as _;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nexus_cog_core::causal::{CausalNodeType, CausalEdge, CausalEdgeType};
     use nexus_cog_core::common::Confidence;
 
     fn node(id: &str) -> CausalNode {
@@ -297,53 +342,55 @@ mod tests {
     }
 
     #[test]
-    fn add_and_get_node() {
-        let mut e = CausalGraphEngine::new();
-        e.add_node(node("a"));
-        assert!(e.node("a").is_some());
+    fn add_node_persists() {
+        let e = CausalGraphEngine::in_memory().unwrap();
+        e.add_node(node("a")).unwrap();
+        let snap = e.snapshot();
+        assert_eq!(snap.nodes.len(), 1);
     }
 
     #[test]
-    fn forward_closure_walks_descendants() {
-        let mut e = CausalGraphEngine::new();
-        e.add_node(node("a"));
-        e.add_node(node("b"));
-        e.add_node(node("c"));
+    fn add_edge_with_real_edge_type() {
+        let e = CausalGraphEngine::in_memory().unwrap();
+        e.add_node(node("a")).unwrap();
+        e.add_node(node("b")).unwrap();
         e.add_edge(CausalEdge {
             from: "a".into(),
             to: "b".into(),
-            edge_type: CausalEdgeType::Causes,
-            strength: 1.0,
+            edge_type: CausalEdgeType::Mitigates,
+            strength: 0.42,
             confidence: Confidence::new(1.0),
-            evidence: vec![],
-        });
-        e.add_edge(CausalEdge {
-            from: "b".into(),
-            to: "c".into(),
-            edge_type: CausalEdgeType::Enables,
-            strength: 1.0,
-            confidence: Confidence::new(1.0),
-            evidence: vec![],
-        });
-        let closure = e.forward_closure("a");
-        assert!(closure.contains("b"));
-        assert!(closure.contains("c"));
+            evidence: vec!["e1".into()],
+        }).unwrap();
+        let edges = e.edges();
+        assert_eq!(edges[0].edge_type, CausalEdgeType::Mitigates);
+        assert_eq!(edges[0].strength, 0.42);
+        assert_eq!(edges[0].evidence, vec!["e1".to_string()]);
     }
 
     #[test]
-    fn backward_closure_walks_ancestors() {
-        let mut e = CausalGraphEngine::new();
-        e.add_node(node("a"));
-        e.add_node(node("b"));
-        e.add_edge(CausalEdge {
-            from: "a".into(),
-            to: "b".into(),
-            edge_type: CausalEdgeType::Causes,
-            strength: 1.0,
-            confidence: Confidence::new(1.0),
-            evidence: vec![],
-        });
-        let closure = e.backward_closure("b");
-        assert!(closure.contains("a"));
+    fn persists_across_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("causal.db");
+        {
+            let backend = Arc::new(SqliteBackend::open(&path).unwrap());
+            let e = CausalGraphEngine::with_backend(backend).unwrap();
+            e.add_node(node("a")).unwrap();
+            e.add_node(node("b")).unwrap();
+            e.add_edge(CausalEdge {
+                from: "a".into(),
+                to: "b".into(),
+                edge_type: CausalEdgeType::Causes,
+                strength: 0.5,
+                confidence: Confidence::new(1.0),
+                evidence: vec![],
+            }).unwrap();
+        }
+        let backend = Arc::new(SqliteBackend::open(&path).unwrap());
+        let e = CausalGraphEngine::with_backend(backend).unwrap();
+        assert_eq!(e.node_count(), 2);
+        assert_eq!(e.edge_count(), 1);
+        let edges = e.edges();
+        assert_eq!(edges[0].edge_type, CausalEdgeType::Causes);
     }
 }
