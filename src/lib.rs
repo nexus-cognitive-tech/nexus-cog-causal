@@ -16,3 +16,10 @@ pub mod forward;
 pub mod graph;
 pub mod pre_mortem;
 pub mod schema;
+
+pub use backward::BackwardReasoner;
+pub use blast_radius::BlastRadiusCalculator;
+pub use counterfactual::CounterfactualReasoner;
+pub use forward::ForwardReasoner;
+pub use graph::CausalGraphEngine;
+pub use pre_mortem::PreMortemEngine;
