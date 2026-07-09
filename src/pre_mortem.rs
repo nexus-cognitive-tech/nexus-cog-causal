@@ -53,10 +53,11 @@ impl PreMortemEngine {
 
     fn generate_scenarios(&self, subject: &str) -> Vec<FailureScenario> {
         let mut scenarios = Vec::new();
+        // `backward_closure` already includes `subject` plus every ancestor;
+        // we don't need to push the subject a second time and we don't want
+        // duplicate entries in the rendered chain.
         let subject_chain: Vec<String> = if self.engine.node(subject).is_some() {
-            let mut chain: Vec<String> = self.engine.backward_closure(subject).into_iter().collect();
-            chain.push(subject.to_string());
-            chain
+            self.engine.backward_closure(subject).into_iter().collect()
         } else {
             Vec::new()
         };
@@ -64,10 +65,7 @@ impl PreMortemEngine {
         // Assumptions are the most likely failure mode: they were never
         // validated.
         for n in &self.engine.nodes_of_type(CausalNodeType::Assumption) {
-            let mut chain = subject_chain.clone();
-            if !chain.contains(&n.id) {
-                chain.push(n.id.clone());
-            }
+            let chain = append_unique(&subject_chain, &n.id);
             scenarios.push(FailureScenario {
                 id: format!("fs-assumption-{}", n.id),
                 title: format!("Assumption `{}` is violated", n.name),
@@ -90,10 +88,7 @@ impl PreMortemEngine {
 
         // Invariants that break are usually catastrophic.
         for n in &self.engine.nodes_of_type(CausalNodeType::Invariant) {
-            let mut chain = subject_chain.clone();
-            if !chain.contains(&n.id) {
-                chain.push(n.id.clone());
-            }
+            let chain = append_unique(&subject_chain, &n.id);
             scenarios.push(FailureScenario {
                 id: format!("fs-invariant-{}", n.id),
                 title: format!("Invariant `{}` is broken", n.name),
@@ -119,10 +114,7 @@ impl PreMortemEngine {
 
         // Constraints under load are the next big class.
         for n in &self.engine.nodes_of_type(CausalNodeType::Constraint) {
-            let mut chain = subject_chain.clone();
-            if !chain.contains(&n.id) {
-                chain.push(n.id.clone());
-            }
+            let chain = append_unique(&subject_chain, &n.id);
             scenarios.push(FailureScenario {
                 id: format!("fs-constraint-{}", n.id),
                 title: format!("Constraint `{}` is exceeded", n.name),
@@ -142,10 +134,7 @@ impl PreMortemEngine {
 
         // Known bugs almost always come back.
         for n in &self.engine.nodes_of_type(CausalNodeType::Bug) {
-            let mut chain = subject_chain.clone();
-            if !chain.contains(&n.id) {
-                chain.push(n.id.clone());
-            }
+            let chain = append_unique(&subject_chain, &n.id);
             scenarios.push(FailureScenario {
                 id: format!("fs-bug-{}", n.id),
                 title: format!("Bug `{}` resurfaces", n.name),
@@ -204,6 +193,45 @@ fn box_str(s: &str) -> &'static str {
     }
 }
 
+/// Clone `chain` and append `extra` only if it isn't already present.
+///
+/// `backward_closure(subject)` already contains `subject`, so the previous
+/// implementation produced `causal_chain`s with the subject id appearing
+/// twice. This helper keeps each chain a strict linear order — no duplicate
+/// ids, no accidental cycles from re-injecting an ancestor at the tail.
+fn append_unique(chain: &[String], extra: &str) -> Vec<String> {
+    let mut out = chain.to_vec();
+    if !out.iter().any(|s| s == extra) {
+        out.push(extra.to_string());
+    }
+    out
+}
+
+#[cfg(test)]
+mod chain_tests {
+    use super::append_unique;
+
+    #[test]
+    fn appends_when_missing() {
+        let v = vec!["a".into(), "b".into()];
+        let r = append_unique(&v, "c");
+        assert_eq!(r, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn skips_when_present() {
+        let v = vec!["a".into(), "b".into()];
+        let r = append_unique(&v, "a");
+        assert_eq!(r, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn works_on_empty_chain() {
+        let r = append_unique(&[], "a");
+        assert_eq!(r, vec!["a"]);
+    }
+}
+
 /// Re-export of [`FailureScenario`] for callers.
 pub use nexus_cog_core::causal::FailureScenario as PreMortemScenario;
 
@@ -258,6 +286,44 @@ mod tests {
         let scenario = r.scenarios.iter().find(|s| s.title.contains("users are authenticated")).unwrap();
         assert!(scenario.causal_chain.contains(&"a1".to_string()));
         assert!(scenario.causal_chain.contains(&"subject".to_string()));
+    }
+
+    #[test]
+    fn causal_chain_has_no_duplicates() {
+        // Regression: previously `causal_chain` contained `subject` twice
+        // because `backward_closure` already includes it and the generator
+        // pushed it again at the tail.
+        let mut e = CausalGraphEngine::in_memory().unwrap();
+        for id in ["subject", "a1", "a2"] {
+            e.add_node(CausalNode {
+                id: id.into(),
+                node_type: if id == "subject" { CausalNodeType::Feature } else { CausalNodeType::Assumption },
+                name: id.into(),
+                description: String::new(),
+                file: None,
+                line: None,
+                confidence: Confidence::new(1.0),
+                tags: vec![],
+            });
+        }
+        for tail in ["a1", "a2"] {
+            e.add_edge(CausalEdge {
+                from: tail.into(),
+                to: "subject".into(),
+                edge_type: CausalEdgeType::Enables,
+                strength: 1.0,
+                confidence: Confidence::new(1.0),
+                evidence: vec![],
+            });
+        }
+        let r = PreMortemEngine::new(e).run("subject");
+        for s in &r.scenarios {
+            let mut sorted = s.causal_chain.clone();
+            sorted.sort();
+            let orig_len = sorted.len();
+            sorted.dedup();
+            assert_eq!(sorted.len(), orig_len, "chain has dup ids: {:?}", s.causal_chain);
+        }
     }
 
     #[test]
